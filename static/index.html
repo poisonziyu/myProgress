@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>学习计划 Agent</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #ededed; font-family: system-ui, "Microsoft YaHei", sans-serif; }
+  #chat {
+    max-width: 640px; margin: 0 auto; height: 100vh;
+    display: flex; flex-direction: column;
+  }
+  #msgs {
+    flex: 1; overflow-y: auto; padding: 16px;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  .bubble {
+    max-width: 82%; padding: 10px 14px; border-radius: 10px;
+    white-space: pre-line; line-height: 1.6; font-size: 15px;
+    word-break: break-word; box-shadow: 0 1px 1px rgba(0,0,0,.05);
+  }
+  .agent { align-self: flex-start; background: #fff; }
+  .user  { align-self: flex-end; background: #95ec69; }
+  #thinking { color: #888; }
+  .dot { display: inline-block; animation: blink 1.2s infinite; }
+  .dot:nth-child(2) { animation-delay: .2s; }
+  .dot:nth-child(3) { animation-delay: .4s; }
+  @keyframes blink { 0%,100% { opacity: .2; } 50% { opacity: 1; } }
+  #inputbar {
+    display: flex; align-items: flex-end; padding: 10px; background: #f7f7f7;
+    border-top: 1px solid #ddd;
+  }
+  #input {
+    flex: 1; padding: 10px 12px; border-radius: 6px;
+    border: 1px solid #ddd; font-size: 15px; outline: none;
+    resize: none; overflow-y: auto; line-height: 1.5;
+    font-family: inherit; max-height: 160px; min-height: 42px;
+  }
+  #input:focus { border-color: #07c160; }
+  #send {
+    margin-left: 8px; height: 42px; padding: 0 20px; border: none; border-radius: 6px;
+    background: #07c160; color: #fff; font-size: 15px; cursor: pointer;
+  }
+  #send:disabled { opacity: .6; cursor: default; }
+</style>
+</head>
+<body>
+<div id="chat">
+  <div id="msgs"></div>
+  <div id="inputbar">
+    <textarea id="input" rows="1" placeholder="一句话汇报，或粘贴材料目录（Enter 发送，Shift+Enter 换行）" autofocus></textarea>
+    <button id="send">发送</button>
+  </div>
+</div>
+<script>
+  const msgs = document.getElementById("msgs");
+  const input = document.getElementById("input");
+  const sendBtn = document.getElementById("send");
+  const thinkingEl = document.createElement("div");
+  thinkingEl.className = "bubble agent";
+  thinkingEl.id = "thinking";
+  thinkingEl.style.display = "none";
+  thinkingEl.innerHTML = '正在思考<span class="dot">.</span><span class="dot">.</span><span class="dot">.</span>';
+  msgs.appendChild(thinkingEl);
+
+  // V1.1 多用户隔离：每个浏览器一个 session_id，后端按它分文件存状态。
+  // 可用 ?session=xxx 指定（方便模拟多用户 / 换设备），否则用 localStorage 里持久化的那个。
+  const SID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+  function sessionId() {
+    const fromUrl = new URLSearchParams(location.search).get("session");
+    if (fromUrl && SID_RE.test(fromUrl)) {
+      try { localStorage.setItem("mp_session_id", fromUrl); } catch (_) {}
+      return fromUrl;
+    }
+    let id = null;
+    try { id = localStorage.getItem("mp_session_id"); } catch (_) {}
+    if (!id || !SID_RE.test(id)) {
+      id = (window.crypto && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : "s" + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+      try { localStorage.setItem("mp_session_id", id); } catch (_) {}
+    }
+    return id;
+  }
+  const SID = sessionId();
+
+  function scrollBottom() { msgs.scrollTop = msgs.scrollHeight; }
+
+  function add(role, text) {
+    const d = document.createElement("div");
+    d.className = "bubble " + role;
+    d.textContent = text;              // textContent 渲染，LLM 输出不会被当 HTML 执行
+    msgs.insertBefore(d, thinkingEl);
+    scrollBottom();
+  }
+
+  function thinking(on) {
+    thinkingEl.style.display = on ? "block" : "none";
+    scrollBottom();
+  }
+
+  function autoGrow() {
+    input.style.height = "auto";
+    input.style.height = Math.min(input.scrollHeight, 160) + "px";
+  }
+
+  async function send() {
+    const text = input.value.trim();
+    if (!text || sendBtn.disabled) return;
+    input.value = "";
+    autoGrow();
+    add("user", text);
+    thinking(true);
+    sendBtn.disabled = true;
+    // 预建一个直播气泡：SSE 分块到达就追加，像打字机一样蹦字
+    const bubble = document.createElement("div");
+    bubble.className = "bubble agent";
+    msgs.insertBefore(bubble, thinkingEl);
+    let full = "";
+    try {
+      const r = await fetch("/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: text, session_id: SID }),
+      });
+      if (!r.ok || !r.body) throw new Error("HTTP " + r.status);
+      const reader = r.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        // SSE 帧以 \n\n 分隔，帧内是 data: {...} 行
+        let sep;
+        while ((sep = buf.indexOf("\n\n")) !== -1) {
+          const frame = buf.slice(0, sep);
+          buf = buf.slice(sep + 2);
+          for (const line of frame.split("\n")) {
+            if (!line.startsWith("data: ")) continue;
+            const raw = line.slice(6);
+            if (raw === "[DONE]") continue;
+            let chunk = raw;
+            try { chunk = JSON.parse(raw).t || ""; } catch (_) {}
+            if (!chunk) continue;
+            full += chunk;
+            bubble.textContent = full;
+            thinking(false);
+            scrollBottom();
+          }
+        }
+      }
+      if (!full) {
+        full = "（空回复）";
+        bubble.textContent = full;
+      }
+    } catch (e) {
+      full = "网络出错了：" + e;
+      bubble.textContent = full;
+    } finally {
+      thinking(false);
+      sendBtn.disabled = false;
+      input.focus();
+      scrollBottom();
+    }
+  }
+
+  sendBtn.addEventListener("click", send);
+  input.addEventListener("input", autoGrow);
+  input.addEventListener("keydown", e => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+  });
+
+  // 粘贴/拖入文件：友好提示只支持文本（V1.1：暂不做上传）
+  const UPLOAD_HINT = "目前只支持文本粘贴哦～把材料目录直接复制成文字发给我就行。";
+  input.addEventListener("paste", e => {
+    const cd = e.clipboardData;
+    if (cd && cd.files && cd.files.length) {
+      e.preventDefault();
+      add("agent", UPLOAD_HINT);
+    }
+    // 纯文本长粘贴是 textarea 原生行为，Ctrl+V 直接可用
+  });
+  ["dragover", "drop"].forEach(ev => document.addEventListener(ev, e => {
+    e.preventDefault();
+    if (ev === "drop" && e.dataTransfer && e.dataTransfer.files.length) {
+      add("agent", UPLOAD_HINT);
+    }
+  }));
+
+  // 打开页面：恢复本 session 的历史 + Agent 主动说一句
+  fetch("/state?session_id=" + encodeURIComponent(SID))
+    .then(r => r.json())
+    .then(data => {
+      (data.chat || []).forEach(m => add(m.role, m.text));
+      if (data.prompt) add("agent", data.prompt);
+      scrollBottom();
+    })
+    .catch(e => add("agent", "加载状态失败：" + e));
+</script>
+</body>
+</html>

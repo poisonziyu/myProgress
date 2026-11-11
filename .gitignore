@@ -1,0 +1,26 @@
+# 密钥与配置 —— 绝不能提交
+.env
+*.env
+!.env.example
+
+# 数据库与状态数据（本地用户数据，不入库）
+*.db
+agent.db
+agent.db-wal
+agent.db-shm
+state_*.json
+state_*.json.bak
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 测试临时产物
+test.db
+*.log
+
+# 工作区内部数据
+.workbuddy/
+.vscode/
